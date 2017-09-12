@@ -20,68 +20,128 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	"os"
-	"os/signal"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/hpcloud/tail"
-	"github.com/martin-helmich/prometheus-nginxlog-exporter/config"
-	"github.com/martin-helmich/prometheus-nginxlog-exporter/discovery"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/satyrius/gonx"
 )
 
-// Metrics is a struct containing pointers to all metrics that should be
-// exposed to Prometheus
-type Metrics struct {
-	countTotal      *prometheus.CounterVec
-	bytesTotal      *prometheus.CounterVec
-	upstreamSeconds *prometheus.SummaryVec
-	responseSeconds *prometheus.SummaryVec
-}
+var reqParamsRegex = regexp.MustCompile(`\?.*`)
+var StaticLabels = []string{"method", "path", "status"}
 
-// Init initializes a metrics struct
-func (m *Metrics) Init(cfg *config.NamespaceConfig) {
+// monitorApplication sets up the parsers and metrics for the log files
+// that belong to a single application
+func monitorApplication(cfg *ApplicationConfig) {
 	cfg.OrderLabels()
 
-	labels := []string{"method", "status"}
-	labels = append(labels, cfg.OrderedLabelNames...)
+	labelNames := append(StaticLabels, cfg.OrderedLabelNames...)
 
-	m.countTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: cfg.Name,
-		Name:      "http_response_count_total",
-		Help:      "Amount of processed HTTP requests",
-	}, labels)
+	metrics := newMetrics(cfg.Name, labelNames)
 
-	m.bytesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: cfg.Name,
-		Name:      "http_response_size_bytes",
-		Help:      "Total amount of transferred bytes",
-	}, labels)
+	parser := gonx.NewParser(cfg.Format)
+	for _, file := range cfg.LogFiles {
+		fmt.Printf("application/%s: monitoring log file %s\n", cfg.Name, file)
+		go monitorFile(file, parser, metrics, &cfg.OrderedLabelValues, &cfg.Paths)
+	}
+}
 
-	m.upstreamSeconds = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Namespace: cfg.Name,
-		Name:      "http_upstream_time_seconds",
-		Help:      "Time needed by upstream servers to handle requests",
-	}, labels)
+// parseRequest parses an nginx $request value into method and path.
+func parseRequest(request string) (string, string, error) {
+	fields := strings.Split(request, " ")
 
-	m.responseSeconds = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Namespace: cfg.Name,
-		Name:      "http_response_time_seconds",
-		Help:      "Time needed by NGINX to handle requests",
-	}, labels)
+	if len(fields) < 2 {
+		return "", "", requestParseError(request)
+	}
 
-	prometheus.MustRegister(m.countTotal)
-	prometheus.MustRegister(m.bytesTotal)
-	prometheus.MustRegister(m.upstreamSeconds)
-	prometheus.MustRegister(m.responseSeconds)
+	path, err := url.PathUnescape(fields[1])
+	if err != nil {
+		return "", "", err
+	}
+	path = reqParamsRegex.ReplaceAllLiteralString(fields[1], "")
+
+	return fields[0], path, nil
+}
+
+// parseUpstreamTime sums an nginx $upstream_response_time value into a single float.
+func parseUpstreamTime(upstreamTime string) (float64, error) {
+	var totalTime float64
+
+	for _, timeString := range strings.Split(upstreamTime, ", ") {
+		time, err := strconv.ParseFloat(timeString, 32)
+		if err != nil {
+			return 0, err
+		}
+		totalTime = totalTime + time
+	}
+	return totalTime, nil
+}
+
+// Tracks and collects metrics for a single log file.
+func monitorFile(file string, parser *gonx.Parser, metrics *metrics, extraLabelValues *[]string,
+	pathConfigs *[]PathConfig) {
+
+	t, err := tail.TailFile(file, tail.Config{
+		Follow: true,
+		ReOpen: true,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	labelValues := make([]string, len(*extraLabelValues)+len(StaticLabels))
+	for i := range *extraLabelValues {
+		labelValues[i+len(StaticLabels)] = (*extraLabelValues)[i]
+	}
+
+	for line := range t.Lines {
+		entry, err := parser.ParseString(line.Text)
+		if err != nil {
+			fmt.Printf("failed to parse line in %s: %s\n", file, err)
+			continue
+		}
+
+		labelValues[0] = "" // method
+		labelValues[1] = "" // path
+		labelValues[2] = "" // status
+
+		if request, err := entry.Field("request"); err == nil {
+			if method, path, err := parseRequest(request); err == nil {
+				labelValues[0] = method
+				for _, pathConfig := range *pathConfigs {
+					path = pathConfig.CompiledPattern().ReplaceAllString(path, pathConfig.ReplaceWith)
+				}
+				labelValues[1] = path
+			}
+		}
+
+		if status, err := entry.Field("status"); err == nil {
+			labelValues[2] = status
+		}
+
+		if bytes, err := entry.FloatField("body_bytes_sent"); err == nil {
+			metrics.bodyBytes.WithLabelValues(labelValues...).Observe(bytes)
+		}
+
+		if upstreamTime, err := entry.Field("upstream_response_time"); err == nil {
+			if totalTime, err := parseUpstreamTime(upstreamTime); err == nil {
+				metrics.upstreamSeconds.WithLabelValues(labelValues...).Observe(totalTime)
+			}
+		}
+
+		if responseTime, err := entry.FloatField("request_time"); err == nil {
+			metrics.requestSeconds.WithLabelValues(labelValues...).Observe(responseTime)
+		}
+	}
 }
 
 func main() {
-	var opts config.StartupFlags
-	var cfg = config.Config{
-		Listen: config.ListenConfig{
+	var opts StartupFlags
+	var cfg = Config{
+		Listen: ListenConfig{
 			Port:    4040,
 			Address: "0.0.0.0",
 		},
@@ -89,7 +149,7 @@ func main() {
 
 	flag.IntVar(&opts.ListenPort, "listen-port", 4040, "HTTP port to listen on")
 	flag.StringVar(&opts.Format, "format", `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for"`, "NGINX access log format")
-	flag.StringVar(&opts.Namespace, "namespace", "nginx", "namespace to use for metric names")
+	flag.StringVar(&opts.Application, "application", "default", "Name of application served by nginx")
 	flag.StringVar(&opts.ConfigFile, "config-file", "", "Configuration file to read from")
 	flag.Parse()
 
@@ -97,100 +157,15 @@ func main() {
 
 	if opts.ConfigFile != "" {
 		fmt.Printf("loading configuration file %s\n", opts.ConfigFile)
-		if err := config.LoadConfigFromFile(&cfg, opts.ConfigFile); err != nil {
+		if err := LoadConfigFromFile(&cfg, opts.ConfigFile); err != nil {
 			panic(err)
 		}
-	} else if err := config.LoadConfigFromFlags(&cfg, &opts); err != nil {
+	} else if err := LoadConfigFromFlags(&cfg, &opts); err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("using configuration %s\n", cfg)
-
-	if cfg.Consul.Enable {
-		registrator, err := discovery.NewConsulRegistrator(&cfg)
-		if err != nil {
-			panic(err)
-		}
-
-		fmt.Printf("registering service in Consul\n")
-		if err := registrator.RegisterConsul(); err != nil {
-			panic(err)
-		}
-
-		exitChan := make(chan os.Signal, 1)
-		signal.Notify(exitChan, os.Interrupt, syscall.SIGTERM)
-
-		go func() {
-			<-exitChan
-			fmt.Printf("unregistering service in Consul\n")
-			registrator.UnregisterConsul()
-			os.Exit(0)
-		}()
-	}
-
-	for _, ns := range cfg.Namespaces {
-		fmt.Printf("starting listener for namespace %s\n", ns.Name)
-
-		go func(nsCfg config.NamespaceConfig) {
-			parser := gonx.NewParser(nsCfg.Format)
-
-			metrics := Metrics{}
-			metrics.Init(&nsCfg)
-
-			for _, f := range nsCfg.SourceFiles {
-				t, err := tail.TailFile(f, tail.Config{
-					Follow: true,
-					ReOpen: true,
-					Poll:   true,
-				})
-				if err != nil {
-					panic(err)
-				}
-
-				go func(nsCfg config.NamespaceConfig) {
-					staticLabelValues := nsCfg.OrderedLabelValues
-					labelValues := make([]string, len(staticLabelValues)+2)
-
-					for i := range staticLabelValues {
-						labelValues[i+2] = staticLabelValues[i]
-					}
-
-					for line := range t.Lines {
-						entry, err := parser.ParseString(line.Text)
-						if err != nil {
-							fmt.Printf("error while parsing line '%s': %s", line.Text, err)
-							continue
-						}
-
-						labelValues[0] = "UNKNOWN"
-						labelValues[1] = "0"
-
-						if request, err := entry.Field("request"); err == nil {
-							f := strings.Split(request, " ")
-							labelValues[0] = f[0]
-						}
-
-						if s, err := entry.Field("status"); err == nil {
-							labelValues[1] = s
-						}
-
-						metrics.countTotal.WithLabelValues(labelValues...).Inc()
-
-						if bytes, err := entry.FloatField("body_bytes_sent"); err == nil {
-							metrics.bytesTotal.WithLabelValues(labelValues...).Add(bytes)
-						}
-
-						if upstreamTime, err := entry.FloatField("upstream_response_time"); err == nil {
-							metrics.upstreamSeconds.WithLabelValues(labelValues...).Observe(upstreamTime)
-						}
-
-						if responseTime, err := entry.FloatField("request_time"); err == nil {
-							metrics.responseSeconds.WithLabelValues(labelValues...).Observe(responseTime)
-						}
-					}
-				}(nsCfg)
-			}
-		}(ns)
+	for i := range cfg.Applications {
+		monitorApplication(&cfg.Applications[i])
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Listen.Address, cfg.Listen.Port)

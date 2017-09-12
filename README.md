@@ -15,7 +15,7 @@ Use the command-line:
     ./nginx-log-exporter \
       -format="<FORMAT>" \
       -listen-port=4040 \
-      -namespace=nginx \
+      -application=nginx \
       [PATHS-TO-LOGFILES...]
 
 Use the configuration file:
@@ -26,16 +26,16 @@ Collected metrics
 -----------------
 
 This exporter collects the following metrics. This collector can listen on
-multiple log files at once and publish metrics in different namespaces. Each
+multiple log files at once and publish metrics in different applications. Each
 metric uses the labels `method` (containing the HTTP request method) and
 `status` (containing the HTTP status code).
 
-- `<namespace>_http_response_count_total` - The total amount of processed HTTP requests/responses.
-- `<namespace>_http_response_size_bytes` - The total amount of transferred content in bytes.
-- `<namespace>_http_upstream_time_seconds` - A summary vector of the upstream
+- `nginx_http_response_count_total` - The total amount of processed HTTP requests/responses.
+- `nginx_http_response_size_bytes` - The total amount of transferred content in bytes.
+- `nginx_http_upstream_time_seconds` - A summary vector of the upstream
   response times in seconds. Logging these needs to be specifically enabled in
   NGINX using the `$upstream_response_time` variable in the log format.
-- `<namespace>_http_response_time_seconds` - A summary vector of the total
+- `nginx_http_response_time_seconds` - A summary vector of the total
   response times in seconds. Logging these needs to be specifically enabled in
   NGINX using the `$request_time` variable in the log format.
 
@@ -53,22 +53,9 @@ listen {
   address = "10.1.2.3"
 }
 
-consul {
-  enable = true
-  address = "localhost:8500"
-  service {
-    id = "nginx-exporter"
-    name = "nginx-exporter"
-    datacenter = "dc1"
-    scheme = "http"
-    token = ""
-    tags = ["foo", "bar"]
-  }
-}
-
-namespace "app-1" {
+application "app-1" {
   format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\" \"$http_x_forwarded_for\""
-  source_files = [
+  log_files = [
     "/var/log/nginx/app1/access.log"
   ]
   labels {
@@ -78,9 +65,9 @@ namespace "app-1" {
   }
 }
 
-namespace "app-2" {
+application "app-2" {
   format = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\" \"$http_x_forwarded_for\" $upstream_response_time"
-  source_files = [
+  log_files = [
     "/var/log/nginx/app2/access.log"
   ]
 }
